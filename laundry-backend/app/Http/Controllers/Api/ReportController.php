@@ -15,9 +15,13 @@ class ReportController extends Controller
 {
     /**
      * Ringkasan statistik untuk halaman Dashboard utama.
+     * Menyesuaikan data berdasarkan role (admin: Keuangan & Operasional, pegawai: Operasional Harian).
      */
-    public function summary(): JsonResponse
+    public function summary(Request $request): JsonResponse
     {
+        $user = $request->user();
+        $isAdmin = in_array($user?->role, ['admin', 'owner'], true);
+
         $today = now()->toDateString();
         $startOfMonth = now()->startOfMonth()->toDateString();
 
@@ -33,71 +37,106 @@ class ReportController extends Controller
             'dibatalkan' => Order::whereIn('status', ['dibatalkan', 'cancelled'])->count(),
         ];
 
-        $totalRevenue = (float) Order::whereIn('payment_status', ['lunas', 'paid'])
-            ->whereNotIn('status', ['dibatalkan', 'cancelled'])
-            ->sum('final_price');
-
-        $todayRevenue = (float) Order::whereIn('payment_status', ['lunas', 'paid'])
-            ->whereNotIn('status', ['dibatalkan', 'cancelled'])
-            ->whereDate('order_date', $today)
-            ->sum('final_price');
-
-        $monthlyRevenue = (float) Order::whereIn('payment_status', ['lunas', 'paid'])
-            ->whereNotIn('status', ['dibatalkan', 'cancelled'])
-            ->whereDate('order_date', '>=', $startOfMonth)
-            ->sum('final_price');
-
-        $unpaidTotal = (float) Order::whereIn('payment_status', ['belum_lunas', 'unpaid', 'sebagian', 'partial'])
-            ->whereNotIn('status', ['dibatalkan', 'cancelled'])
-            ->sum('final_price');
-
         $recentOrders = Order::with(['customer', 'items.service'])
             ->latest('order_date')
             ->limit(5)
             ->get();
 
+        $responseData = [
+            'role' => $isAdmin ? 'admin' : 'pegawai',
+            'total_orders' => $totalOrders,
+            'today_orders' => $todayOrders,
+            'total_customers' => $totalCustomers,
+            'status_counts' => $statusCounts,
+            'recent_orders' => $recentOrders,
+        ];
+
+        if ($isAdmin) {
+            $totalRevenue = (float) Order::whereIn('payment_status', ['lunas', 'paid'])
+                ->whereNotIn('status', ['dibatalkan', 'cancelled'])
+                ->sum('final_price');
+
+            $todayRevenue = (float) Order::whereIn('payment_status', ['lunas', 'paid'])
+                ->whereNotIn('status', ['dibatalkan', 'cancelled'])
+                ->whereDate('order_date', $today)
+                ->sum('final_price');
+
+            $monthlyRevenue = (float) Order::whereIn('payment_status', ['lunas', 'paid'])
+                ->whereNotIn('status', ['dibatalkan', 'cancelled'])
+                ->whereDate('order_date', '>=', $startOfMonth)
+                ->sum('final_price');
+
+            $unpaidTotal = (float) Order::whereIn('payment_status', ['belum_lunas', 'unpaid', 'sebagian', 'partial'])
+                ->whereNotIn('status', ['dibatalkan', 'cancelled'])
+                ->sum('final_price');
+
+            $responseData['revenue'] = [
+                'today' => $todayRevenue,
+                'this_month' => $monthlyRevenue,
+                'total_paid' => $totalRevenue,
+                'total_unpaid_orders_value' => $unpaidTotal,
+            ];
+        }
+
         return response()->json([
             'success' => true,
-            'data' => [
-                'total_orders' => $totalOrders,
-                'today_orders' => $todayOrders,
-                'total_customers' => $totalCustomers,
-                'status_counts' => $statusCounts,
-                'revenue' => [
-                    'today' => $todayRevenue,
-                    'this_month' => $monthlyRevenue,
-                    'total_paid' => $totalRevenue,
-                    'total_unpaid_orders_value' => $unpaidTotal,
-                ],
-                'recent_orders' => $recentOrders,
-            ],
+            'data' => $responseData,
         ]);
     }
 
     /**
-     * Rekap laporan pendapatan berdasarkan rentang tanggal.
+     * Rekap laporan transaksi & keuangan berdasarkan rentang tanggal,
+     * filter status pembayaran (semua / lunas / belum_lunas),
+     * dan filter metode pembayaran (semua / tunai / qris / transfer).
      */
     public function revenue(Request $request): JsonResponse
     {
         $startDate = $request->query('start_date', now()->startOfMonth()->toDateString());
         $endDate = $request->query('end_date', now()->toDateString());
+        $paymentStatusFilter = strtolower((string) $request->query('payment_status', 'all'));
+        $paymentMethodFilter = strtolower((string) $request->query('payment_method', 'all'));
+
+        $methodVariants = match ($paymentMethodFilter) {
+            'tunai', 'cash' => ['tunai', 'cash'],
+            'qris', 'ewallet' => ['qris', 'ewallet'],
+            'transfer' => ['transfer'],
+            default => null,
+        };
 
         $ordersQuery = Order::with(['customer', 'items.service', 'payments'])
             ->whereDate('order_date', '>=', $startDate)
             ->whereDate('order_date', '<=', $endDate)
             ->whereNotIn('status', ['dibatalkan', 'cancelled']);
 
+        if (in_array($paymentStatusFilter, ['lunas', 'paid'], true)) {
+            $ordersQuery->whereIn('payment_status', ['lunas', 'paid']);
+        } elseif (in_array($paymentStatusFilter, ['belum_lunas', 'unpaid'], true)) {
+            $ordersQuery->whereIn('payment_status', ['belum_lunas', 'unpaid', 'sebagian', 'partial']);
+        }
+
+        if ($methodVariants !== null) {
+            $ordersQuery->whereHas('payments', function ($q) use ($methodVariants) {
+                $q->whereIn(DB::raw('LOWER(payment_method)'), $methodVariants);
+            });
+        }
+
         $allOrders = (clone $ordersQuery)->latest('order_date')->get();
 
         $paidOrders = $allOrders->whereIn('payment_status', ['lunas', 'paid']);
         $unpaidOrders = $allOrders->whereIn('payment_status', ['belum_lunas', 'unpaid', 'sebagian', 'partial']);
 
-        $grossRevenue = (float) $paidOrders->sum('total_price');
-        $totalDiscount = (float) $paidOrders->sum('discount');
+        $grossRevenue = (float) $allOrders->sum('total_price');
+        $totalDiscount = (float) $allOrders->sum('discount');
         $netRevenue = (float) $paidOrders->sum('final_price');
-        $potentialUnpaid = (float) $unpaidOrders->sum('final_price');
+        $potentialUnpaid = (float) $unpaidOrders->sum(function (Order $order) {
+            $paid = (float) $order->payments
+                ->whereIn('status', ['lunas', 'paid'])
+                ->sum('amount');
 
-        // Rekap harian berdasarkan pesanan lunas
+            return max(0, (float) $order->final_price - $paid);
+        });
+
+        // Rekap harian berdasarkan pesanan
         $dailyRevenue = Order::select(
                 DB::raw('DATE(order_date) as date'),
                 DB::raw('COUNT(*) as total_orders'),
@@ -111,31 +150,73 @@ class ReportController extends Controller
             ->orderBy('date')
             ->get();
 
-        // Rekap berdasarkan metode pembayaran dari tabel payments
-        $byPaymentMethod = Payment::select(
-                'payment_method',
-                DB::raw('COUNT(*) as transactions_count'),
-                DB::raw('SUM(amount) as total_amount')
-            )
+        // Rekap berdasarkan metode pembayaran dari tabel payments (distandarkan: Tunai, QRIS, Transfer)
+        $paymentsQuery = Payment::query()
             ->whereDate('payment_date', '>=', $startDate)
             ->whereDate('payment_date', '<=', $endDate)
-            ->whereIn('status', ['lunas', 'paid'])
-            ->groupBy('payment_method')
-            ->get();
+            ->whereIn('status', ['lunas', 'paid']);
 
-        // Rekap layanan terlaris pada periode tersebut
+        if ($methodVariants !== null) {
+            $paymentsQuery->whereIn(DB::raw('LOWER(payment_method)'), $methodVariants);
+        }
+
+        $rawPayments = $paymentsQuery->get();
+        $totalCashReceived = (float) $rawPayments->sum('amount');
+
+        $methodGroups = [
+            'Tunai' => ['variants' => ['tunai', 'cash'], 'transactions_count' => 0, 'total_amount' => 0.0],
+            'QRIS' => ['variants' => ['qris', 'ewallet'], 'transactions_count' => 0, 'total_amount' => 0.0],
+            'Transfer' => ['variants' => ['transfer'], 'transactions_count' => 0, 'total_amount' => 0.0],
+        ];
+
+        foreach ($rawPayments as $p) {
+            $m = strtolower((string) $p->payment_method);
+            if (in_array($m, ['tunai', 'cash'], true)) {
+                $key = 'Tunai';
+            } elseif (in_array($m, ['qris', 'ewallet'], true)) {
+                $key = 'QRIS';
+            } else {
+                $key = 'Transfer';
+            }
+            $methodGroups[$key]['transactions_count']++;
+            $methodGroups[$key]['total_amount'] += (float) $p->amount;
+        }
+
+        $byPaymentMethod = collect($methodGroups)->map(function ($info, $label) {
+            return [
+                'payment_method' => $label,
+                'transactions_count' => $info['transactions_count'],
+                'total_amount' => $info['total_amount'],
+            ];
+        })->values();
+
+        // Rekap layanan paling laris berdasarkan jumlah transaksi di order_items
         $topServices = OrderItem::select(
                 'service_id',
+                DB::raw('COUNT(*) as transactions_count'),
                 DB::raw('SUM(quantity) as total_quantity'),
                 DB::raw('SUM(subtotal) as total_revenue')
             )
             ->with('service:id,name,unit,price')
-            ->whereHas('order', function ($q) use ($startDate, $endDate) {
+            ->whereHas('order', function ($q) use ($startDate, $endDate, $paymentStatusFilter, $methodVariants) {
                 $q->whereDate('order_date', '>=', $startDate)
                   ->whereDate('order_date', '<=', $endDate)
                   ->whereNotIn('status', ['dibatalkan', 'cancelled']);
+
+                if (in_array($paymentStatusFilter, ['lunas', 'paid'], true)) {
+                    $q->whereIn('payment_status', ['lunas', 'paid']);
+                } elseif (in_array($paymentStatusFilter, ['belum_lunas', 'unpaid'], true)) {
+                    $q->whereIn('payment_status', ['belum_lunas', 'unpaid', 'sebagian', 'partial']);
+                }
+
+                if ($methodVariants !== null) {
+                    $q->whereHas('payments', function ($pq) use ($methodVariants) {
+                        $pq->whereIn(DB::raw('LOWER(payment_method)'), $methodVariants);
+                    });
+                }
             })
             ->groupBy('service_id')
+            ->orderByDesc('transactions_count')
             ->orderByDesc('total_revenue')
             ->get();
 
@@ -145,6 +226,8 @@ class ReportController extends Controller
                 'period' => [
                     'start_date' => $startDate,
                     'end_date' => $endDate,
+                    'payment_status' => $paymentStatusFilter,
+                    'payment_method' => $paymentMethodFilter,
                 ],
                 'summary' => [
                     'total_orders' => $allOrders->count(),
@@ -153,6 +236,7 @@ class ReportController extends Controller
                     'gross_revenue' => $grossRevenue,
                     'total_discount' => $totalDiscount,
                     'net_revenue' => $netRevenue,
+                    'cash_received' => $totalCashReceived,
                     'unpaid_receivables' => $potentialUnpaid,
                 ],
                 'daily_breakdown' => $dailyRevenue,

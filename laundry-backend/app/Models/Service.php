@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
@@ -18,6 +19,10 @@ class Service extends Model
         'is_active',
     ];
 
+    protected $appends = [
+        'estimated_hours',
+    ];
+
     protected function casts(): array
     {
         return [
@@ -28,6 +33,17 @@ class Service extends Model
     }
 
     /**
+     * Alias atribut estimated_hours yang terhubung ke kolom estimated_duration (dalam satuan jam).
+     */
+    protected function estimatedHours(): Attribute
+    {
+        return Attribute::make(
+            get: fn () => (int) ($this->estimated_duration ?? 24),
+            set: fn ($value) => ['estimated_duration' => (int) $value],
+        );
+    }
+
+    /**
      * Relasi ke tabel order_items (Satu layanan bisa digunakan di banyak item pesanan).
      */
     public function orderItems()
@@ -35,4 +51,3 @@ class Service extends Model
         return $this->hasMany(OrderItem::class);
     }
 }
-

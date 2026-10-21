@@ -11,7 +11,8 @@ use Illuminate\Database\Seeder;
 class OrderSeeder extends Seeder
 {
     /**
-     * Seed data transaksi pesanan dan pembayaran awal agar dashboard dan laporan tidak kosong saat diuji.
+     * Seed data transaksi pesanan dan pembayaran awal lengkap dengan skenario
+     * Smart Alert (Overdue / Terlambat, Deadline < 6 Jam, serta Belum Diambil & Belum Lunas).
      */
     public function run(): void
     {
@@ -23,7 +24,10 @@ class OrderSeeder extends Seeder
             return;
         }
 
+        $now = now();
+
         $sampleOrders = [
+            // 1. Sudah diambil & Lunas
             [
                 'order_number' => 'BL-1043',
                 'customer' => $customers[5],
@@ -32,12 +36,13 @@ class OrderSeeder extends Seeder
                 'total' => 56000,
                 'status' => 'diambil',
                 'payment_status' => 'lunas',
-                'order_date' => '2026-10-15 09:00:00',
-                'due_date' => '2026-10-17 09:00:00',
+                'order_date' => $now->copy()->subDays(3),
+                'due_date' => $now->copy()->subDays(1),
                 'paid_amount' => 56000,
-                'paid_date' => '2026-10-17 14:00:00',
+                'paid_date' => $now->copy()->subDays(1),
                 'method' => 'tunai',
             ],
+            // 2. Selesai namun Belum Diambil (Sudah Lunas)
             [
                 'order_number' => 'BL-1044',
                 'customer' => $customers[4],
@@ -46,12 +51,13 @@ class OrderSeeder extends Seeder
                 'total' => 25000,
                 'status' => 'selesai',
                 'payment_status' => 'lunas',
-                'order_date' => '2026-10-16 10:00:00',
-                'due_date' => '2026-10-17 10:00:00',
+                'order_date' => $now->copy()->subDays(2),
+                'due_date' => $now->copy()->subHours(12),
                 'paid_amount' => 25000,
-                'paid_date' => '2026-10-16 10:15:00',
+                'paid_date' => $now->copy()->subDays(2),
                 'method' => 'transfer',
             ],
+            // 3. OVERDUE (Terlambat): Status masih 'diproses', waktu estimasi selesai sudah lewat 5 jam lalu
             [
                 'order_number' => 'BL-1045',
                 'customer' => $customers[3],
@@ -60,12 +66,13 @@ class OrderSeeder extends Seeder
                 'total' => 48000,
                 'status' => 'diproses',
                 'payment_status' => 'belum_lunas',
-                'order_date' => '2026-10-17 08:30:00',
-                'due_date' => '2026-10-19 08:30:00',
+                'order_date' => $now->copy()->subHours(53),
+                'due_date' => $now->copy()->subHours(5),
                 'paid_amount' => 0,
                 'paid_date' => null,
                 'method' => null,
             ],
+            // 4. Selesai namun Belum Diambil & Belum Lunas (Baru bayar sebagian)
             [
                 'order_number' => 'BL-1046',
                 'customer' => $customers[2],
@@ -74,12 +81,13 @@ class OrderSeeder extends Seeder
                 'total' => 60000,
                 'status' => 'selesai',
                 'payment_status' => 'sebagian',
-                'order_date' => '2026-10-17 11:00:00',
-                'due_date' => '2026-10-20 11:00:00',
+                'order_date' => $now->copy()->subDays(2),
+                'due_date' => $now->copy()->subHours(2),
                 'paid_amount' => 20000,
-                'paid_date' => '2026-10-17 11:05:00',
+                'paid_date' => $now->copy()->subDays(2),
                 'method' => 'tunai',
             ],
+            // 5. SEGERA JATUH TEMPO (Deadline < 6 Jam): Status 'diproses', sisa waktu 3 jam lagi
             [
                 'order_number' => 'BL-1047',
                 'customer' => $customers[1],
@@ -88,12 +96,13 @@ class OrderSeeder extends Seeder
                 'total' => 42000,
                 'status' => 'diproses',
                 'payment_status' => 'lunas',
-                'order_date' => '2026-10-18 09:30:00',
-                'due_date' => '2026-10-19 09:30:00',
+                'order_date' => $now->copy()->subHours(21),
+                'due_date' => $now->copy()->addHours(3),
                 'paid_amount' => 42000,
-                'paid_date' => '2026-10-18 09:35:00',
+                'paid_date' => $now->copy()->subHours(20),
                 'method' => 'qris',
             ],
+            // 6. SEGERA JATUH TEMPO (Deadline < 6 Jam): Status 'diterima', sisa waktu 4 jam lagi
             [
                 'order_number' => 'BL-1048',
                 'customer' => $customers[0],
@@ -102,8 +111,8 @@ class OrderSeeder extends Seeder
                 'total' => 36000,
                 'status' => 'diterima',
                 'payment_status' => 'belum_lunas',
-                'order_date' => '2026-10-18 10:15:00',
-                'due_date' => '2026-10-20 10:15:00',
+                'order_date' => $now->copy()->subHours(44),
+                'due_date' => $now->copy()->addHours(4),
                 'paid_amount' => 0,
                 'paid_date' => null,
                 'method' => null,
@@ -148,4 +157,3 @@ class OrderSeeder extends Seeder
         }
     }
 }
-

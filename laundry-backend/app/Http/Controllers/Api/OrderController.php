@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Order;
 use App\Models\Service;
+use App\Services\WhatsAppService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -70,14 +71,21 @@ class OrderController extends Controller
 
     /**
      * Membuat pesanan baru beserta perhitungan otomatis harga item, total, diskon,
-     * estimasi selesai, dan pencatatan pembayaran awal jika langsung lunas.
+     * estimasi selesai, pencatatan pelanggan baru (jika opsi + Pelanggan Baru dipilih),
+     * dan pencatatan pembayaran awal jika langsung lunas.
      */
     public function store(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'customer_id' => ['required', 'exists:customers,id'],
+            'customer_id' => ['nullable', 'required_without:new_customer', 'exists:customers,id'],
+            'new_customer' => ['nullable', 'required_without:customer_id', 'array'],
+            'new_customer.name' => ['required_with:new_customer', 'string', 'max:255'],
+            'new_customer.phone' => ['required_with:new_customer', 'string', 'max:25'],
+            'new_customer.address' => ['nullable', 'string'],
+            'new_customer.notes' => ['nullable', 'string'],
             'order_date' => ['nullable', 'date'],
             'estimated_completion_date' => ['nullable', 'date'],
+            'estimated_done_at' => ['nullable', 'date'],
             'discount' => ['nullable', 'numeric', 'min:0'],
             'status' => ['nullable', Rule::in(self::ALLOWED_STATUSES)],
             'payment_status' => ['nullable', Rule::in(self::ALLOWED_PAYMENT_STATUSES)],
@@ -91,6 +99,20 @@ class OrderController extends Controller
         ]);
 
         $order = DB::transaction(function () use ($validated, $request) {
+            // Jika kasir menginput pelanggan baru langsung dari form pesanan
+            if (! empty($validated['new_customer'])) {
+                $newCustData = $validated['new_customer'];
+                $customer = \App\Models\Customer::create([
+                    'name' => $newCustData['name'],
+                    'phone' => \App\Models\Customer::normalizePhone($newCustData['phone']),
+                    'address' => $newCustData['address'] ?? null,
+                    'notes' => $newCustData['notes'] ?? null,
+                ]);
+                $customerId = $customer->id;
+            } else {
+                $customerId = $validated['customer_id'];
+            }
+
             $totalPrice = 0;
             $maxDurationHours = 0;
             $orderItemsPayload = [];
@@ -103,8 +125,9 @@ class OrderController extends Controller
 
                 $totalPrice += $subtotal;
 
-                if ($service->estimated_duration && $service->estimated_duration > $maxDurationHours) {
-                    $maxDurationHours = (int) $service->estimated_duration;
+                $serviceHours = (int) ($service->estimated_duration ?? 24);
+                if ($serviceHours > $maxDurationHours) {
+                    $maxDurationHours = $serviceHours;
                 }
 
                 $orderItemsPayload[] = [
@@ -119,9 +142,29 @@ class OrderController extends Controller
             $discount = isset($validated['discount']) ? (float) $validated['discount'] : 0;
             $finalPrice = max(0, round($totalPrice - $discount, 2));
 
-            $orderDate = isset($validated['order_date']) ? now()->parse($validated['order_date']) : now();
-            $estimatedCompletionDate = $validated['estimated_completion_date']
-                ?? ($maxDurationHours > 0 ? $orderDate->copy()->addHours($maxDurationHours) : $orderDate->copy()->addDays(2));
+            $orderDate = isset($validated['order_date'])
+                ? now()->parse($validated['order_date'])
+                : now();
+
+            // Jika tanggal order_date dikirim tanpa jam (YYYY-MM-DD), gunakan jam saat ini agar perhitungan jam presisi
+            if (isset($validated['order_date']) && strlen(trim($validated['order_date'])) <= 10) {
+                $orderDate->setTimeFrom(now());
+            }
+
+            $manualEstimatedDone = $validated['estimated_done_at']
+                ?? $validated['estimated_completion_date']
+                ?? null;
+
+            if (! empty($manualEstimatedDone)) {
+                $estimatedCompletionDate = now()->parse($manualEstimatedDone);
+                if (strlen(trim((string) $manualEstimatedDone)) <= 10) {
+                    $estimatedCompletionDate->setTimeFrom($orderDate);
+                }
+            } else {
+                // Hitung otomatis berdasarkan nilai estimated_hours terlama dari item layanan
+                $hoursToAdd = $maxDurationHours > 0 ? $maxDurationHours : 48;
+                $estimatedCompletionDate = $orderDate->copy()->addHours($hoursToAdd);
+            }
 
             $paymentStatus = $validated['payment_status'] ?? 'belum_lunas';
             $paidAmount = isset($validated['paid_amount']) ? (float) $validated['paid_amount'] : 0;
@@ -136,7 +179,7 @@ class OrderController extends Controller
 
             $order = Order::create([
                 'order_number' => $this->generateOrderNumber(),
-                'customer_id' => $validated['customer_id'],
+                'customer_id' => $customerId,
                 'user_id' => $request->user()?->id,
                 'order_date' => $orderDate,
                 'estimated_completion_date' => $estimatedCompletionDate,
@@ -219,11 +262,12 @@ class OrderController extends Controller
      * Endpoint khusus untuk memperbarui status pengerjaan pesanan
      * (diterima -> diproses -> selesai -> diambil).
      */
-    public function updateStatus(Request $request, Order $order): JsonResponse
+    public function updateStatus(Request $request, Order $order, WhatsAppService $waService): JsonResponse
     {
         $validated = $request->validate([
             'status' => ['required', Rule::in(self::ALLOWED_STATUSES)],
             'notes' => ['nullable', 'string'],
+            'auto_notify_wa' => ['nullable', 'boolean'],
         ]);
 
         $updateData = ['status' => $validated['status']];
@@ -235,10 +279,73 @@ class OrderController extends Controller
 
         $order->update($updateData);
 
+        $waNotificationData = null;
+        if (! empty($validated['auto_notify_wa']) && in_array(strtolower($validated['status']), ['selesai', 'ready'], true)) {
+            $order->load(['customer', 'items.service', 'payments']);
+            $phone = (string) ($order->customer?->phone ?? '');
+            $message = $waService->buildReadyNotificationMessage($order);
+            $gatewayResult = $waService->send($phone, $message);
+            $waLink = $waService->buildWaLink($phone, $message);
+
+            $order->update(['wa_notified_at' => now()]);
+
+            $waNotificationData = [
+                'wa_link' => $waLink,
+                'wa_notified_at' => $order->wa_notified_at?->toIso8601String(),
+                'gateway_sent' => $gatewayResult['gateway_sent'],
+                'gateway_info' => $gatewayResult['info'],
+                'message_text' => $message,
+            ];
+        }
+
         return response()->json([
             'success' => true,
             'message' => "Status pesanan berhasil diperbarui menjadi '{$validated['status']}'.",
             'data' => $order->fresh(['customer', 'user', 'items.service', 'payments']),
+            'wa_notification' => $waNotificationData,
+        ]);
+    }
+
+    /**
+     * Mengirim notifikasi WhatsApp (Hybrid: Bot API Gateway + Direct WA Link)
+     * untuk memberitahukan pelanggan bahwa cucian sudah selesai & siap diambil,
+     * serta mencatat waktu pengiriman pada kolom wa_notified_at.
+     */
+    public function notifyWa(Order $order, WhatsAppService $waService): JsonResponse
+    {
+        $order->load(['customer', 'user', 'items.service', 'orderItems.service', 'payments']);
+
+        if (! $order->customer || empty($order->customer->phone)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Nomor WhatsApp pelanggan tidak ditemukan pada pesanan ini.',
+            ], 422);
+        }
+
+        $message = $waService->buildReadyNotificationMessage($order);
+        $gatewayResult = $waService->send($order->customer->phone, $message);
+        $waLink = $waService->buildWaLink($order->customer->phone, $message);
+
+        $order->update([
+            'wa_notified_at' => now(),
+        ]);
+
+        $freshOrder = $order->fresh(['customer', 'user', 'items.service', 'payments']);
+
+        return response()->json([
+            'success' => true,
+            'message' => $gatewayResult['gateway_sent']
+                ? 'Notifikasi WhatsApp berhasil dikirim otomatis via Gateway & status WA diperbarui.'
+                : 'Status notifikasi WA tercatat. Membuka WhatsApp pelanggan...',
+            'data' => [
+                'wa_link' => $waLink,
+                'wa_notified_at' => $freshOrder?->wa_notified_at?->toIso8601String(),
+                'gateway_sent' => $gatewayResult['gateway_sent'],
+                'gateway_mode' => $gatewayResult['mode'],
+                'gateway_info' => $gatewayResult['info'],
+                'message_text' => $message,
+                'order' => $freshOrder,
+            ],
         ]);
     }
 

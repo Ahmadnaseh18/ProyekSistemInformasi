@@ -14,9 +14,10 @@ return new class extends Migration
         Schema::create('customers', function (Blueprint $table) {
             $table->id();
             $table->string('name');
-            $table->string('phone', 20);
+            $table->string('phone', 25);
             $table->string('email')->nullable();
             $table->text('address')->nullable();
+            $table->text('notes')->nullable()->comment('Preferensi parfum atau catatan khusus pakaian');
             $table->timestamps();
         });
     }
